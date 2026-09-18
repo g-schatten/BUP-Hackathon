@@ -1,0 +1,8 @@
+/problem-statement
+__pycache__/
+*.pyc
+.venv/
+.env
+.azure_env
+*.log
+

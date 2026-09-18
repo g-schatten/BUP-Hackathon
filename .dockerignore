@@ -1,0 +1,10 @@
+.git
+.gitignore
+PLAN.md
+README.md
+problem-statement
+tests
+*.pyc
+__pycache__
+.azure_env
+*.env
