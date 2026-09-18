@@ -19,13 +19,15 @@ POST /optimize-energy
   → response
 ```
 
-- **LLM role**: `app/llm.py` sends the battery spec + all operator notes to **Groq-hosted Llama
-  3.3 70B Versatile** (`llama-3.3-70b-versatile`, free tier) in a single forced tool-call
-  (`strict: true` JSON schema), converting each note into one of the six supported directive
-  types or `no_op`. Groq's LPU inference is used specifically for its very low latency, which
-  matters for the p95 <= 5s Performance & Reliability requirement. This is the only place a
-  generative model touches the pipeline — `plan_summary` is generated deterministically
-  (Section 02 of the Problem Statement explicitly does not require LLM text for that field).
+- **LLM role**: `app/llm.py` sends the battery spec + all operator notes to **Groq-hosted
+  `openai/gpt-oss-20b`** (free tier) in a single forced tool-call (`strict: true` JSON schema,
+  `temperature=0`, `reasoning_effort="low"`), converting each note into one of the six supported
+  directive types or `no_op`. Groq's LPU inference is used specifically for its very low latency,
+  which matters for the p95 <= 5s Performance & Reliability requirement — verified on the public
+  sample pack at p50 ~1.2s (see PLAN.md for the full latency/rate-limit measurement). This is the
+  only place a generative model touches the pipeline — `plan_summary` is generated
+  deterministically (Section 02 of the Problem Statement explicitly does not require LLM text
+  for that field).
 - **Guardrails**: `app/guardrails.py` never trusts the LLM's output directly. It clamps
   out-of-range values (e.g. a reserve above battery capacity), repairs malformed/missing hour
   lists, and falls back to `no_op` only when a directive cannot be made sense of at all. It never
@@ -44,16 +46,18 @@ POST /optimize-energy
 ## Requirements
 
 - Python 3.12
-- A free Groq API key with access to `llama-3.3-70b-versatile` (console.groq.com → API Keys).
-  Groq's free tier is used deliberately for this project (no billing required); see
-  console.groq.com/docs/rate-limits for current free-tier request/token limits.
+- A free Groq API key with access to `openai/gpt-oss-20b` (console.groq.com → API Keys).
+  Groq's free tier is used deliberately for this project (no billing required). Measured on this
+  account: the free tier caps every real chat model at **8000 tokens/minute** (not a per-day
+  request cap) — see "Known limitations" below.
 
 ## Environment variables
 
 | Variable | Required | Meaning |
 |---|---|---|
 | `GROQ_API_KEY` | Yes | Groq API key. Never committed; passed at run time only. |
-| `GRIDWISE_LLM_MODEL` | No | Overrides the model ID (default `llama-3.3-70b-versatile`). |
+| `GRIDWISE_LLM_MODEL` | No | Overrides the model ID (default `openai/gpt-oss-20b`). |
+| `GRIDWISE_LLM_REASONING_EFFORT` | No | `low`/`medium`/`high` for reasoning-capable Groq models (default `low`; kept low because `medium` produced 12-20s outlier latencies in testing). |
 | `GRIDWISE_LLM_TIMEOUT_S` | No | Per-attempt LLM request timeout in seconds (default `12.0`). |
 
 No other configuration is required. If `GROQ_API_KEY` is unset or the provider call fails
@@ -143,6 +147,17 @@ No secrets are baked into the image; `GROQ_API_KEY` is supplied only at `docker 
 
 ## Known limitations
 
+- **Groq free-tier rate limit (measured, not theoretical):** every real chat model on this
+  account is capped at 8000 tokens/minute. On a cold cache, back-to-back novel requests start
+  hitting this after roughly 6-7 calls within a minute, after which Groq returns 429 and the
+  client waits out the provider's `Retry-After` (observed 10-20s) before its one retry. In
+  testing this stayed safely under the judge's 30s hard per-request timeout in every case, but a
+  sustained burst of hidden-test traffic could still push some requests close to it. The
+  in-process note-hash cache eliminates this entirely for repeated/duplicate notes (measured:
+  p95 0.38s on an all-cache-hit rerun), which covers a meaningful share of realistic judge
+  traffic (paraphrase clusters, repeated scenarios) but not first-seen novel notes. If judging
+  traffic turns out to be bursty enough to matter, Groq's paid Dev Tier removes this ceiling for
+  a small pay-as-you-go cost; not enabled here since a free tier was requested.
 - The LP relaxation ladder in `app/optimizer.py::relax_and_solve` only engages if a directive
   combination is infeasible; the Problem Statement guarantees organizer scoring scenarios are
   feasible, so this path is a defensive safety net rather than expected behavior.

@@ -58,18 +58,42 @@ back to a paid tier / secondary key). The Groq chat.completions API is OpenAI-co
 (`tools`/`tool_choice`/`response_format`), verified directly against the installed `groq` 1.7.0
 SDK's type definitions rather than assumed from memory.
 
-### LLM layer rules
-- **Llama 3.3 70B Versatile** (`llama-3.3-70b-versatile`) on Groq — free, fast (well inside the
-  p95 ≤ 5s bar), supports tool calling. One call for all 1–3 notes, **forced tool-call**
-  (`tool_choice={"type":"function","function":{"name":"emit_directive_interpretation"}}`)
-  **plus `strict: true`** on the function definition, which constrains the arguments to match
-  our JSON Schema — malformed shape becomes far less likely, and `json.loads` + pydantic
-  validation still guards the remaining risk (Groq's own docs note the model "does not always
-  generate valid JSON"). Retry once (`max_retries=1`) on transport errors.
-- **Rate limits are the one real risk of the free tier** — verify current limits at
-  console.groq.com/docs/rate-limits once the key exists, and keep the in-process note-hash
-  cache (below) warm to avoid redundant calls across repeated/paraphrased hidden notes.
-- Prompt carries: the six directive types with exact `structured_adjustment` shapes, the hour-window convention, factor semantics, the battery object (for % reserves), 6–8 few-shot paraphrase examples covering each type + a distractor, and "output exactly N entries, one per note, in order".
+### LLM layer rules — MEASURED against the live account, not assumed
+
+**Model catalog drifted from what the public docs page said.** `llama-3.3-70b-versatile` (the
+originally planned model) returned `404 model_not_found` on this account — Groq's currently
+available chat models here are `openai/gpt-oss-20b`, `openai/gpt-oss-120b`, and
+`qwen/qwen3.8-27b` (confirmed via an authenticated `GET /openai/v1/models` call, which is ground
+truth over any cached docs page). **In use: `openai/gpt-oss-20b`.**
+
+**The real free-tier constraint is TPM (tokens/minute), not RPM.** Every real chat model on this
+account is capped at **8000 tokens/minute** (confirmed via the `x-ratelimit-limit-tokens`
+response header on all three candidates — it's an account-level ceiling, not model-specific).
+`groq/compound`/`compound-mini` have a much higher TPM (70000) but explicitly do not support
+custom tool definitions ("Custom tools are not supported at this time" per Groq's own compound
+docs), so they can't run our extraction tool at all. Mitigations applied, in order of impact:
+1. **Shrank the system prompt ~60%** (1320 → ~540 estimated tokens): fewer, denser few-shot
+   examples, no restated rules. This alone roughly doubled how many calls fit in one TPM window
+   before throttling.
+2. **`reasoning_effort="low"`** on the gpt-oss/qwen3 reasoning models — the Groq-documented
+   default ("medium") produced wildly variable reasoning-token counts (12–20s wall-clock on some
+   public cases even before any rate-limit was involved).
+3. **`temperature=0`** — not a token-budget fix, but cut real accuracy flakiness observed in
+   testing (a distractor note flipped between `no_op` and a real directive across otherwise
+   identical runs); determinism also helps the paraphrase-robustness sub-score.
+4. **`max_completion_tokens=1024`** (down from 2048) as a hard ceiling on worst-case output spend.
+5. In-process cache by `sha256(notes + battery_capacity)` — confirmed empirically: a warm-cache
+   rerun of all 10 public cases came back at p95 0.38s with zero new API calls.
+
+**Result on the 10 public samples, cold cache, `openai/gpt-oss-20b`:** 10/10 interpretation
+correct, 10/10 valid plans, cost-quality ratio 1.0000, **p50 latency ~1.1–1.5s, p95 ~8–10s**
+(the p95 tail is exactly the TPM throttling kicking in after ~6-7 back-to-back novel calls, each
+throttled wait plus retry still lands safely under the judge's 30s hard timeout in every observed
+case, but this is the free tier's one real remaining risk under bursty hidden-test traffic — see
+"Known limitations" in README.md). `tool_choice` forced to the one function, **`strict: true`**
+on its schema, `json.loads` + pydantic re-validation of the arguments (Groq's own docs note the
+model "does not always generate valid JSON"), `max_retries=1` on transport/429 errors.
+- Prompt carries: the six directive types with exact `structured_adjustment` shapes, the hour-window convention, factor semantics, the battery object (for % reserves), and one compact example per type + a distractor.
 - **Guardrails (deterministic, after the model):** type ∈ enum; exactly one entry per note index, ascending; hours unique ints 0–23 sorted; `0 ≤ factor ≤ 1`; `0 ≤ reserve ≤ capacity`; `max_grid_kwh ≥ 0` finite; `applies=true` iff not `no_op`; `structured_adjustment=null` iff `no_op`. **Repair, don't discard** — a repaired directive still earns application credit; a dropped one earns nothing.
 - **Fallback interpreter (regex/heuristic) runs only if the provider errors or output is unusable.** Documented as a degraded path, never the primary — sole phrase-matching is explicitly non-compliant.
 - Cache by `sha256(note)` → interpretation, in-process. Hidden sets reuse phrasings; this protects p95 latency.

@@ -29,8 +29,16 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("gridwise.llm")
 
-MODEL_ID = os.environ.get("GRIDWISE_LLM_MODEL", "llama-3.3-70b-versatile")
+MODEL_ID = os.environ.get("GRIDWISE_LLM_MODEL", "openai/gpt-oss-20b")
 REQUEST_TIMEOUT_S = float(os.environ.get("GRIDWISE_LLM_TIMEOUT_S", "12.0"))
+# gpt-oss / qwen3 models on Groq are reasoning models; "medium" (their default)
+# produces highly variable, sometimes very long reasoning traces before the
+# final tool call - observed 12-20s wall-clock on some public sample cases,
+# blowing the p95<=5s Performance & Reliability budget. "low" keeps latency
+# consistent with a small, measured accuracy cost (see PLAN.md for the
+# before/after comparison). Ignored for models that don't support the field.
+REASONING_EFFORT = os.environ.get("GRIDWISE_LLM_REASONING_EFFORT", "low")
+REASONING_CAPABLE_MARKERS = ("gpt-oss", "qwen")
 
 DIRECTIVE_TYPES = (
     "solar_reduction",
@@ -41,84 +49,43 @@ DIRECTIVE_TYPES = (
     "no_op",
 )
 
-SYSTEM_PROMPT = """You are the operator-note interpreter for a campus energy scheduling system (GridWise).
+SYSTEM_PROMPT = """Interpret campus operator notes for GridWise energy scheduling (24 hours, 0-23).
+Convert EACH note to exactly one directive. Admin/facilities chatter unrelated to energy -> no_op.
+Never invent a type outside this list or a number the note doesn't support.
 
-You will receive a battery specification and a numbered list of 1-3 short operator notes about \
-a 24-hour campus energy schedule (hours 0-23). Convert EACH note into exactly one structured \
-directive. Some notes are realistic distractors (facilities/admin chatter unrelated to the \
-energy schedule) - mark those no_op. Never invent a directive type outside the list below, and \
-never invent numeric values the note does not support.
+Types (directive_type) and their required fields:
+- solar_reduction: hours + factor (FRACTION REMAINING, not removed: "80% reduction"->0.2, "drops
+  to 20%"->0.2, "half"->0.5, "one-fifth"->0.2).
+- minimum_battery_reserve: hours + minimum_energy_kwh (absolute kWh). If given as % of capacity,
+  compute minimum_energy_kwh = pct * capacity_kwh (capacity given below) - never leave as a %.
+- no_charge_window: hours only (charging blocked).
+- no_discharge_window: hours only (discharging blocked).
+- max_grid_window: hours + max_grid_kwh (grid import cap).
+- no_op: everything null (distractor / irrelevant note).
 
-SUPPORTED DIRECTIVE TYPES (use exactly these strings for directive_type):
-- solar_reduction: usable solar is reduced during specific hours. Needs hours + factor.
-  factor = the FRACTION OF SOLAR THAT REMAINS (not the amount removed).
-  Example: "drops to 20%" -> factor 0.2. "an 80% reduction" -> factor 0.2 (100%-80%=20% remains).
-  "roughly half" -> factor 0.5. "one-fifth of normal" -> factor 0.2.
-- minimum_battery_reserve: battery must stay at or above a level during specific hours.
-  Needs hours + minimum_energy_kwh (an absolute kWh number).
-  If the note gives a PERCENTAGE OF BATTERY CAPACITY (e.g. "50% of capacity"), you MUST compute
-  minimum_energy_kwh = that percentage * the battery's capacity_kwh given below. Do not leave it
-  as a percentage.
-- no_charge_window: battery charging is unavailable during specific hours. Needs hours only.
-- no_discharge_window: battery discharging is unavailable during specific hours. Needs hours only.
-- max_grid_window: grid import may not exceed a stated kWh amount during specific hours.
-  Needs hours + max_grid_kwh.
-- no_op: the note does not affect today's 24-hour energy schedule (distractor, or unrelated
-  campus/admin news). hours/factor/minimum_energy_kwh/max_grid_kwh must all be omitted (null).
+Hours: integers 0-23, unique, ascending. Windows are start-inclusive/end-exclusive: list every
+hour from start up to but NOT including end - the count is (end-start) hours. "1-3 PM" or
+"13:00-15:00" -> [13,14] (2 hours, not 15). "6 PM until 9 PM" -> [18,19,20] (3 hours). "6 PM
+until 10 PM" -> [18,19,20,21] (4 hours - don't drop the last one). Noon = hour 12. A window
+wrapping midnight, e.g. "10 PM until 2 AM" -> [0,1,22,23] (sorted). "all day" -> [0..23].
 
-HOUR CONVENTION (critical - get this exactly right):
-- Hours are whole-hour integers 0-23. The 24-hour day is hour 0 = 12:00-1:00 AM ... hour 23 =
-  11:00 PM-midnight.
-- A window is START-INCLUSIVE, END-EXCLUSIVE. "1 PM to 3 PM" or "13:00 to 15:00" means the window
-  covers hour 13 and hour 14, but NOT hour 15 -> hours = [13, 14].
-- "6 PM until 9 PM" -> hours = [18, 19, 20] (not 21).
-- "from noon until 2 PM" -> noon is hour 12 -> hours = [12, 13].
-- A window that wraps past midnight, e.g. "10 PM until 2 AM", covers hours 22, 23, 0, 1 -> return
-  them SORTED ASCENDING: hours = [0, 1, 22, 23].
-- "all day" / "for the entire day" / "throughout the day" -> hours = [0,1,2,...,23] (all 24).
-- hours must be unique integers, ascending, each between 0 and 23 inclusive.
+Rules: one entry per note, note_index = its position, same order given. applies=true for every
+non-no_op type; only no_op uses applies=false. Don't alter demand/tariff/battery params yourself.
+explanation: one short sentence.
 
-GENERAL RULES:
-- Produce exactly one entry per note, with note_index matching the note's position (starting
-  at 0), in the same order the notes are given.
-- For every non-no_op directive, applies must be true. no_op is the only directive with
-  applies = false.
-- Do not change or assume anything about demand, tariff, or battery parameters other than what
-  a supported directive explicitly lets you change.
-- explanation: one short sentence justifying the interpretation.
+Examples (paraphrases mean the same rule):
+"Solar drops to ~20% from 1-3 PM" / "80% reduction in solar during the 1-3 PM window" ->
+  solar_reduction hours=[13,14] factor=0.2
+"Do not charge 2-4 PM" -> no_charge_window hours=[14,15]
+"Keep >=120 kWh in reserve 6-9 PM" -> minimum_battery_reserve hours=[18,19,20] minimum_energy_kwh=120
+"Keep >=50% of capacity in reserve 6-9 PM" (capacity=200) -> minimum_battery_reserve
+  hours=[18,19,20] minimum_energy_kwh=100
+"No discharge 6-8 PM" -> no_discharge_window hours=[18,19]
+"Grid import capped at 180 kWh 7-9 PM" -> max_grid_window hours=[19,20] max_grid_kwh=180
+"Charger offline 10 PM until 2 AM" -> no_charge_window hours=[0,1,22,23]
+"The cafeteria menu changes tomorrow" -> no_op
 
-WORKED EXAMPLES (paraphrases of the same rule are common in real notes - match the underlying
-rule, not the exact wording):
-1. "Solar output will drop to about 20% from 1 PM to 3 PM."
-   -> directive_type=solar_reduction, hours=[13,14], factor=0.2
-2. "PV production will drop to about 20% between 13:00 and 15:00."
-   -> same as example 1: directive_type=solar_reduction, hours=[13,14], factor=0.2
-3. "Expect an 80% reduction in rooftop solar during the 1-3 PM maintenance window."
-   -> directive_type=solar_reduction, hours=[13,14], factor=0.2 (80% reduction -> 20% remains)
-4. "Panel washing from one until three will leave roughly one-fifth of normal solar output."
-   -> directive_type=solar_reduction, hours=[13,14], factor=0.2
-5. "Do not charge the battery between 2 PM and 4 PM."
-   -> directive_type=no_charge_window, hours=[14,15]
-6. "The charging circuit will be unavailable from 2 AM until 5 AM for electrical maintenance."
-   -> directive_type=no_charge_window, hours=[2,3,4]
-7. "Keep at least 120 kWh in reserve from 6 PM until 9 PM."
-   -> directive_type=minimum_battery_reserve, hours=[18,19,20], minimum_energy_kwh=120
-8. "Keep at least 50% of the battery capacity stored in the battery from 6 PM until 9 PM."
-   (if battery capacity_kwh=200) -> directive_type=minimum_battery_reserve, hours=[18,19,20],
-   minimum_energy_kwh=100  (0.5 * 200)
-9. "For protection testing, the battery must not discharge from 6 PM until 8 PM."
-   -> directive_type=no_discharge_window, hours=[18,19]
-10. "The evening transformer limit is 180 kWh of grid import from 7 PM until 9 PM."
-    -> directive_type=max_grid_window, hours=[19,20], max_grid_kwh=180
-11. "The battery charger will be offline from 10 PM until 2 AM."
-    -> directive_type=no_charge_window, hours=[0,1,22,23]
-12. "Do not charge the battery at any point today."
-    -> directive_type=no_charge_window, hours=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23]
-13. "The cafeteria menu changes tomorrow." / "The library is extending book-return hours next
-    week." / "A seminar room booking was moved to next week."
-    -> directive_type=no_op (all fields null except explanation)
-
-Respond by calling the emit_directive_interpretation tool only. Do not respond with plain text."""
+Call the emit_directive_interpretation tool only. No plain text."""
 
 
 class RawDirectiveEntry(BaseModel):
@@ -246,17 +213,23 @@ def interpret_notes(operator_notes: list[str], battery_capacity: float) -> list[
         }
     )
 
+    kwargs: dict = {}
+    if any(marker in MODEL_ID for marker in REASONING_CAPABLE_MARKERS) and REASONING_EFFORT:
+        kwargs["reasoning_effort"] = REASONING_EFFORT
+
     try:
         client = groq.Groq(timeout=REQUEST_TIMEOUT_S, max_retries=1)
         response = client.chat.completions.create(
             model=MODEL_ID,
-            max_completion_tokens=2048,
+            max_completion_tokens=1024,
+            temperature=0,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
             tools=[TOOL_DEFINITION],
             tool_choice={"type": "function", "function": {"name": "emit_directive_interpretation"}},
+            **kwargs,
         )
     except Exception:  # noqa: BLE001 - any provider failure is a safe-failure case
         logger.exception("LLM interpretation call failed; falling back to no_op for all notes")
