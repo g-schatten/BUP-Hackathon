@@ -1,30 +1,5 @@
 # 3-Minute Solution Video — Script & Shot List
 
-**Hard cap 3:00** — the guide treats over-length as a fail on this criterion, so the margin matters.
-
-Narration is **398 words** (measured, not estimated). Actual runtime depends on your pace:
-
-| Your pace | Narration alone | + ~20s of pauses/transitions |
-|---|---|---|
-| 135 wpm (slow) | 2:56 | **3:16 — too long** |
-| 150 wpm (normal) | 2:39 | 2:59 — cutting it fine |
-| 165 wpm (brisk) | 2:24 | **2:44 — safe** |
-
-**So: read at a brisk-but-natural pace and keep screen transitions tight.** Time your first take.
-If it lands over 2:50, use the cut list in Delivery Notes at the bottom rather than speeding up.
-
-**What the rubric requires this video to cover** (Participant Guide §02, §08, §10 — scored only as
-a tie-break, but reviewers compare exactly these four things):
-
-| # | Requirement | Covered in |
-|---|---|---|
-| 1 | Problem understanding | Section 1 |
-| 2 | Architecture overview | Section 2 |
-| 3 | LLM → deterministic guardrails → optimizer flow | Sections 2 & 3 |
-| 4 | How the solution is run and tested | Section 4 |
-
----
-
 ## Before you hit record
 
 - [ ] Terminal at `~/Desktop/BUP-Hackathon`, font size bumped up (readable at 1080p)
@@ -39,11 +14,9 @@ a tie-break, but reviewers compare exactly these four things):
       ```
 - [ ] Warm the LLM cache so the live demo is fast and reliable:
       `.venv/bin/python tests/test_endpoint.py http://gridwise-fop62.centralindia.cloudapp.azure.com`
-- [ ] Section 4's commands copied somewhere you can paste from mid-recording
+- [ ] The three terminal commands below copied somewhere you can paste from mid-recording
 
 ---
-
-## Section 1 — The problem (0:00–0:35) · *Requirement 1*
 
 **On screen:** the Problem Statement PDF, then the sample JSON showing `operator_notes`.
 
@@ -58,8 +31,6 @@ a tie-break, but reviewers compare exactly these four things):
 
 ---
 
-## Section 2 — Architecture (0:35–1:00) · *Requirements 2 & 3*
-
 **On screen:** the architecture diagram in `README.md`, highlighting each stage as you name it.
 
 > "Four stages — and the key principle is that the LLM's output is treated as untrusted until
@@ -71,9 +42,7 @@ a tie-break, but reviewers compare exactly these four things):
 
 ---
 
-## Section 3 — Implementation (1:00–2:00) · *Requirement 3, in depth*
-
-**On screen:** cut between the four files as you mention each, ~13s per file.
+**On screen:** cut between the four files as you mention each.
 
 **`app/llm.py`:**
 > "The LLM is Groq-hosted `gpt-oss-20b` — all notes in one forced tool call, strict JSON schema,
@@ -96,8 +65,6 @@ a tie-break, but reviewers compare exactly these four things):
 > valid schedule still comes back."
 
 ---
-
-## Section 4 — Run & test (2:00–2:30) · *Requirement 4*
 
 **On screen:** live terminal. Run these for real — don't show stills.
 
@@ -125,23 +92,8 @@ curl -s -X POST http://gridwise-fop62.centralindia.cloudapp.azure.com/optimize-e
 
 ---
 
-## Section 5 — Results & close (2:30–2:45)
-
 **On screen:** the final summary lines of the test output.
 
 > "Ten out of ten on interpretation, every plan valid, and our cost matches the organisers'
 > reference optimum exactly — quality ratio 1.0, at about a second median latency. Setup and the
 > Docker fallback are in the README. Thanks for watching."
-
----
-
-## Delivery notes
-
-- **The one sentence that matters most** to a tie-break reviewer is in Section 2: *"the LLM's output
-  is treated as untrusted until deterministic code has checked it."* Say it clearly — that
-  separation is exactly what they're grading.
-- Narrate the *intent* while code is on screen; don't read code aloud.
-- One take is fine. Production quality is explicitly not judged — clarity is.
-- **If you overrun**, cut in this order: (1) the setup sentence in Section 5, (2) the last sentence
-  of the `validator.py` paragraph, (3) the `optimizer.py` paragraph down to "It's a linear program
-  solved with SciPy's HiGHS; directives modify the model."
