@@ -45,12 +45,30 @@ POST /optimize-energy
   → response
 ```
 
-**Stack:** Python 3.11 · FastAPI + uvicorn · scipy HiGHS (`linprog`) · `anthropic` SDK (**Claude Haiku 4.5**, model ID `claude-haiku-4-5` — no date suffix) · Docker · Azure VM.
+**Stack:** Python 3.12 · FastAPI + uvicorn · scipy HiGHS (`linprog`) · `groq` SDK (**Llama 3.3 70B Versatile**, model ID `llama-3.3-70b-versatile`, free tier) · Docker · Azure VM.
+
+**Decision change (2026-09-18): switched from Anthropic to Groq at the user's request for a
+free option.** Groq's free tier hosts open models (Llama 3.3 70B Versatile, gpt-oss-20b/120b,
+etc.) on custom LPU inference hardware at very low latency (~280 tok/s for the 70B model per
+console.groq.com/docs/models, confirmed live) with **no billing required**. This is a genuine
+upgrade on the latency dimension versus the original Anthropic plan, at zero cost, with the
+trade-off that free-tier rate limits apply (check console.groq.com/docs/rate-limits before the
+event — if the hidden test volume is large, confirm the limit comfortably covers it, or fall
+back to a paid tier / secondary key). The Groq chat.completions API is OpenAI-compatible
+(`tools`/`tool_choice`/`response_format`), verified directly against the installed `groq` 1.7.0
+SDK's type definitions rather than assumed from memory.
 
 ### LLM layer rules
-- **Claude Haiku 4.5** (`claude-haiku-4-5`) — cheapest + fastest, chosen for the p95 ≤ 5s bar. One call for all 1–3 notes, no extended thinking, **forced tool-use** (`tool_choice={"type":"tool","name":"emit_directives"}`) **plus `strict: true`** on the tool definition, which guarantees the arguments validate against our JSON Schema — parse failures become structurally impossible. Retry once with backoff on transport errors.
-- **Model choice is measured, not assumed.** At ~1k tokens/call, Haiku costs ~$0.0017 and Sonnet 5 ~$0.0034 per case — the whole round is well under $1 either way, so the decision is purely accuracy vs latency. Once the harness exists, run the 10 public cases + paraphrase suite against `claude-haiku-4-5` and `claude-sonnet-5`, compare interpretation accuracy and p95, keep the winner. Budget: 5 minutes.
-- Note: Haiku 4.5 needs a **4096-token** prefix before prompt caching engages (Sonnet 5 needs 1024) — our system prompt will likely sit under that, so Anthropic-side caching may never fire. Our own note-hash cache is what actually protects p95.
+- **Llama 3.3 70B Versatile** (`llama-3.3-70b-versatile`) on Groq — free, fast (well inside the
+  p95 ≤ 5s bar), supports tool calling. One call for all 1–3 notes, **forced tool-call**
+  (`tool_choice={"type":"function","function":{"name":"emit_directive_interpretation"}}`)
+  **plus `strict: true`** on the function definition, which constrains the arguments to match
+  our JSON Schema — malformed shape becomes far less likely, and `json.loads` + pydantic
+  validation still guards the remaining risk (Groq's own docs note the model "does not always
+  generate valid JSON"). Retry once (`max_retries=1`) on transport errors.
+- **Rate limits are the one real risk of the free tier** — verify current limits at
+  console.groq.com/docs/rate-limits once the key exists, and keep the in-process note-hash
+  cache (below) warm to avoid redundant calls across repeated/paraphrased hidden notes.
 - Prompt carries: the six directive types with exact `structured_adjustment` shapes, the hour-window convention, factor semantics, the battery object (for % reserves), 6–8 few-shot paraphrase examples covering each type + a distractor, and "output exactly N entries, one per note, in order".
 - **Guardrails (deterministic, after the model):** type ∈ enum; exactly one entry per note index, ascending; hours unique ints 0–23 sorted; `0 ≤ factor ≤ 1`; `0 ≤ reserve ≤ capacity`; `max_grid_kwh ≥ 0` finite; `applies=true` iff not `no_op`; `structured_adjustment=null` iff `no_op`. **Repair, don't discard** — a repaired directive still earns application credit; a dropped one earns nothing.
 - **Fallback interpreter (regex/heuristic) runs only if the provider errors or output is unusable.** Documented as a degraded path, never the primary — sole phrase-matching is explicitly non-compliant.
@@ -142,7 +160,7 @@ rsynced directly and built on the VM; GHCR is only for the separate fallback-ima
 ```bash
 rsync -az --delete app requirements.txt Dockerfile .dockerignore azureuser@$FQDN:~/gridwise-app/
 ssh azureuser@$FQDN "cd ~/gridwise-app && sudo docker build -t gridwise:v1 ."
-ssh azureuser@$FQDN "sudo docker rm -f gridwise 2>/dev/null; sudo docker run -d --name gridwise --restart unless-stopped -p 80:8000 -e ANTHROPIC_API_KEY=\"\$ANTHROPIC_API_KEY\" gridwise:v1"
+ssh azureuser@$FQDN "sudo docker rm -f gridwise 2>/dev/null; sudo docker run -d --name gridwise --restart unless-stopped -p 80:8000 -e GROQ_API_KEY=\"\$GROQ_API_KEY\" gridwise:v1"
 ```
 
 ```bash
@@ -150,17 +168,17 @@ ssh azureuser@$FQDN "sudo docker rm -f gridwise 2>/dev/null; sudo docker run -d 
 docker pull ghcr.io/<user>/gridwise:<tag>
 docker rm -f gridwise 2>/dev/null
 docker run -d --name gridwise --restart unless-stopped -p 80:8000 \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  -e GROQ_API_KEY="$GROQ_API_KEY" \
   ghcr.io/<user>/gridwise:<tag>
 curl -s http://localhost/health
 ```
 
 Rules to hold to:
-- **The key never enters the image or the repo** — only `-e ANTHROPIC_API_KEY` at run time; README documents the *name* only.
+- **The key never enters the image or the repo** — only `-e GROQ_API_KEY` at run time; README documents the *name* only.
 - Keep a 2 vCPU / 4 GB shape (`Standard_B2as_v2` in use) — a 1 GB `B1s`-class size is tight for scipy + uvicorn and risks an OOM mid-judging. ~$0.03-0.04/hr, well inside the student credit.
 - Give the VM a DNS name label at create time; if time allows late in the round, put Caddy in front for automatic HTTPS on that hostname (plain HTTP on port 80 is acceptable and is the default path).
 - No auto-shutdown schedule on the VM. `az vm deallocate` only after the evaluation window closes.
 - Tag the image with an immutable tag (e.g. `v1`, `v2`) and submit the exact one that is running.
 
 ## 7. Open decisions
-Live endpoint is up; the two remaining blockers are the `ANTHROPIC_API_KEY` (LLM interpretation is currently in safe-failure no_op mode without it) and a GitHub username/PAT to push the GHCR fallback image (not yet built - `gh auth status` shows no logged-in host in this environment).
+Live endpoint is up; the two remaining blockers are the `GROQ_API_KEY` (LLM interpretation is currently in safe-failure no_op mode without it) and a GitHub username/PAT to push the GHCR fallback image (not yet built - `gh auth status` shows no logged-in host in this environment).

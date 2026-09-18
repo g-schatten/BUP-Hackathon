@@ -19,9 +19,11 @@ POST /optimize-energy
   → response
 ```
 
-- **LLM role**: `app/llm.py` sends the battery spec + all operator notes to **Claude Haiku 4.5**
-  (`claude-haiku-4-5`) in a single forced tool-use call (`strict: true` schema), converting each
-  note into one of the six supported directive types or `no_op`. This is the only place a
+- **LLM role**: `app/llm.py` sends the battery spec + all operator notes to **Groq-hosted Llama
+  3.3 70B Versatile** (`llama-3.3-70b-versatile`, free tier) in a single forced tool-call
+  (`strict: true` JSON schema), converting each note into one of the six supported directive
+  types or `no_op`. Groq's LPU inference is used specifically for its very low latency, which
+  matters for the p95 <= 5s Performance & Reliability requirement. This is the only place a
   generative model touches the pipeline — `plan_summary` is generated deterministically
   (Section 02 of the Problem Statement explicitly does not require LLM text for that field).
 - **Guardrails**: `app/guardrails.py` never trusts the LLM's output directly. It clamps
@@ -42,19 +44,19 @@ POST /optimize-energy
 ## Requirements
 
 - Python 3.12
-- An Anthropic API key with access to `claude-haiku-4-5` (console.anthropic.com → API Keys).
-  A Claude.ai / Claude Code subscription does **not** include API credits — these are billed
-  separately.
+- A free Groq API key with access to `llama-3.3-70b-versatile` (console.groq.com → API Keys).
+  Groq's free tier is used deliberately for this project (no billing required); see
+  console.groq.com/docs/rate-limits for current free-tier request/token limits.
 
 ## Environment variables
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Yes | Anthropic API key. Never committed; passed at run time only. |
-| `GRIDWISE_LLM_MODEL` | No | Overrides the model ID (default `claude-haiku-4-5`). |
+| `GROQ_API_KEY` | Yes | Groq API key. Never committed; passed at run time only. |
+| `GRIDWISE_LLM_MODEL` | No | Overrides the model ID (default `llama-3.3-70b-versatile`). |
 | `GRIDWISE_LLM_TIMEOUT_S` | No | Per-attempt LLM request timeout in seconds (default `12.0`). |
 
-No other configuration is required. If `ANTHROPIC_API_KEY` is unset or the provider call fails
+No other configuration is required. If `GROQ_API_KEY` is unset or the provider call fails
 for any reason, the service does **not** crash — every affected note is safely treated as
 `no_op` and a valid (if less directive-aware) schedule is still returned (SAFE FAILURE path).
 
@@ -66,7 +68,7 @@ cd BUP-Hackathon
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-export ANTHROPIC_API_KEY=sk-ant-...   # required for LLM interpretation
+export GROQ_API_KEY=gsk_...   # required for LLM interpretation
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -99,7 +101,7 @@ python3 tests/run_samples.py
 ```
 
 Run the public sample pack against a live HTTP endpoint (exercises the full LLM →
-guardrails → optimizer pipeline; requires `ANTHROPIC_API_KEY` to be set on the server):
+guardrails → optimizer pipeline; requires `GROQ_API_KEY` to be set on the server):
 
 ```bash
 python3 tests/test_endpoint.py http://localhost:8000
@@ -110,7 +112,7 @@ python3 tests/test_endpoint.py http://localhost:8000
 ```bash
 docker build -t gridwise:latest .
 docker run -d --name gridwise --restart unless-stopped -p 8000:8000 \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  -e GROQ_API_KEY="$GROQ_API_KEY" \
   gridwise:latest
 curl -s http://localhost:8000/health
 ```
@@ -120,11 +122,11 @@ curl -s http://localhost:8000/health
 ```bash
 docker pull ghcr.io/<owner>/gridwise:<tag>
 docker run -d --name gridwise --restart unless-stopped -p 80:8000 \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  -e GROQ_API_KEY="$GROQ_API_KEY" \
   ghcr.io/<owner>/gridwise:<tag>
 ```
 
-No secrets are baked into the image; `ANTHROPIC_API_KEY` is supplied only at `docker run` time.
+No secrets are baked into the image; `GROQ_API_KEY` is supplied only at `docker run` time.
 
 ## Deployed endpoint
 
@@ -137,7 +139,7 @@ No secrets are baked into the image; `ANTHROPIC_API_KEY` is supplied only at `do
 - [FastAPI](https://fastapi.tiangolo.com/) + [uvicorn](https://www.uvicorn.org/) — HTTP service
 - [scipy](https://scipy.org/) (`linprog`, HiGHS solver) — the optimization engine
 - [pydantic](https://docs.pydantic.dev/) — request/response schema validation
-- [Anthropic Python SDK](https://github.com/anthropics/anthropic-sdk-python) — LLM interpretation
+- [Groq Python SDK](https://github.com/groq/groq-python) — LLM interpretation (Llama 3.3 70B Versatile, free tier)
 
 ## Known limitations
 
@@ -152,6 +154,6 @@ No secrets are baked into the image; `ANTHROPIC_API_KEY` is supplied only at `do
 
 ## Secret handling
 
-No API keys, tokens, or `.env` files are committed to this repository. `ANTHROPIC_API_KEY` is
+No API keys, tokens, or `.env` files are committed to this repository. `GROQ_API_KEY` is
 read from the environment only. Application logs never print request/response bodies containing
 secrets, and unhandled server errors return a generic `500` with no stack trace to the client.

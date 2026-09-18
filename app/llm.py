@@ -5,10 +5,12 @@ is never trusted directly - `app.guardrails.apply_guardrails` re-validates
 and repairs everything before it reaches the optimizer. This module's job is
 just to turn natural-language notes into a best-effort structured guess.
 
-Model: Claude Haiku 4.5 (`claude-haiku-4-5`) - chosen for the Performance &
-Reliability p95<=5s latency requirement. See PLAN.md for the accuracy/latency
-trade-off measurement against claude-sonnet-5; swap MODEL_ID below if that
-measurement favors Sonnet.
+Model: Groq-hosted Llama 3.3 70B Versatile (`llama-3.3-70b-versatile`) - a
+free-tier, tool-calling-capable model served on Groq's LPU inference, chosen
+for the Performance & Reliability p95<=5s latency requirement (Groq serves
+this model at ~280 tokens/sec, far faster than typical API latency). See
+PLAN.md for the free-tier rate-limit notes; swap MODEL_ID below if a
+different Groq model is preferred.
 
 SAFE FAILURE (Section 08): if the provider errors, times out, or returns
 something unusable, this module returns an empty list rather than raising -
@@ -27,7 +29,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("gridwise.llm")
 
-MODEL_ID = os.environ.get("GRIDWISE_LLM_MODEL", "claude-haiku-4-5")
+MODEL_ID = os.environ.get("GRIDWISE_LLM_MODEL", "llama-3.3-70b-versatile")
 REQUEST_TIMEOUT_S = float(os.environ.get("GRIDWISE_LLM_TIMEOUT_S", "12.0"))
 
 DIRECTIVE_TYPES = (
@@ -116,7 +118,7 @@ rule, not the exact wording):
     week." / "A seminar room booking was moved to next week."
     -> directive_type=no_op (all fields null except explanation)
 
-Respond using the emit_directive_interpretation tool only."""
+Respond by calling the emit_directive_interpretation tool only. Do not respond with plain text."""
 
 
 class RawDirectiveEntry(BaseModel):
@@ -134,48 +136,56 @@ class RawInterpretation(BaseModel):
     directive_interpretation: list[RawDirectiveEntry]
 
 
-TOOL_SCHEMA = {
-    "name": "emit_directive_interpretation",
-    "description": "Return the structured directive interpretation for every operator note.",
-    "strict": True,
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "directive_interpretation": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "note_index": {"type": "integer"},
-                        "applies": {"type": "boolean"},
-                        "directive_type": {"type": "string", "enum": list(DIRECTIVE_TYPES)},
-                        "hours": {
-                            "anyOf": [
-                                {"type": "array", "items": {"type": "integer"}},
-                                {"type": "null"},
-                            ]
+# OpenAI-compatible function-calling schema (Groq's chat.completions API mirrors
+# the OpenAI tool-calling shape: {"type": "function", "function": {...}}).
+# `strict: True` requires every property to be listed in `required` and every
+# object to set `additionalProperties: False` - optional fields are modeled as
+# `required` + nullable via `anyOf` with `null`, the standard strict-schema idiom.
+TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "emit_directive_interpretation",
+        "description": "Return the structured directive interpretation for every operator note.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "directive_interpretation": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "note_index": {"type": "integer"},
+                            "applies": {"type": "boolean"},
+                            "directive_type": {"type": "string", "enum": list(DIRECTIVE_TYPES)},
+                            "hours": {
+                                "anyOf": [
+                                    {"type": "array", "items": {"type": "integer"}},
+                                    {"type": "null"},
+                                ]
+                            },
+                            "factor": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                            "minimum_energy_kwh": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                            "max_grid_kwh": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                            "explanation": {"type": "string"},
                         },
-                        "factor": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-                        "minimum_energy_kwh": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-                        "max_grid_kwh": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-                        "explanation": {"type": "string"},
+                        "required": [
+                            "note_index",
+                            "applies",
+                            "directive_type",
+                            "hours",
+                            "factor",
+                            "minimum_energy_kwh",
+                            "max_grid_kwh",
+                            "explanation",
+                        ],
+                        "additionalProperties": False,
                     },
-                    "required": [
-                        "note_index",
-                        "applies",
-                        "directive_type",
-                        "hours",
-                        "factor",
-                        "minimum_energy_kwh",
-                        "max_grid_kwh",
-                        "explanation",
-                    ],
-                    "additionalProperties": False,
-                },
-            }
+                }
+            },
+            "required": ["directive_interpretation"],
+            "additionalProperties": False,
         },
-        "required": ["directive_interpretation"],
-        "additionalProperties": False,
     },
 }
 
@@ -222,9 +232,9 @@ def interpret_notes(operator_notes: list[str], battery_capacity: float) -> list[
         return _cache[key]
 
     try:
-        import anthropic
+        import groq
     except ImportError:
-        logger.error("anthropic package not installed; falling back to no_op for all notes")
+        logger.error("groq package not installed; falling back to no_op for all notes")
         return []
 
     user_content = json.dumps(
@@ -237,28 +247,34 @@ def interpret_notes(operator_notes: list[str], battery_capacity: float) -> list[
     )
 
     try:
-        client = anthropic.Anthropic(timeout=REQUEST_TIMEOUT_S, max_retries=1)
-        response = client.messages.create(
+        client = groq.Groq(timeout=REQUEST_TIMEOUT_S, max_retries=1)
+        response = client.chat.completions.create(
             model=MODEL_ID,
-            max_tokens=2048,
-            system=SYSTEM_PROMPT,
-            tools=[TOOL_SCHEMA],
-            tool_choice={"type": "tool", "name": "emit_directive_interpretation"},
-            messages=[{"role": "user", "content": user_content}],
+            max_completion_tokens=2048,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            tools=[TOOL_DEFINITION],
+            tool_choice={"type": "function", "function": {"name": "emit_directive_interpretation"}},
         )
     except Exception:  # noqa: BLE001 - any provider failure is a safe-failure case
         logger.exception("LLM interpretation call failed; falling back to no_op for all notes")
         return []
 
-    tool_use = next((b for b in response.content if getattr(b, "type", None) == "tool_use"), None)
-    if tool_use is None:
-        logger.warning("LLM response had no tool_use block (stop_reason=%s)", response.stop_reason)
+    tool_calls = response.choices[0].message.tool_calls if response.choices else None
+    if not tool_calls:
+        logger.warning(
+            "LLM response had no tool call (finish_reason=%s)",
+            response.choices[0].finish_reason if response.choices else "unknown",
+        )
         return []
 
     try:
-        parsed = RawInterpretation.model_validate(tool_use.input)
+        args = json.loads(tool_calls[0].function.arguments)
+        parsed = RawInterpretation.model_validate(args)
     except Exception:  # noqa: BLE001 - malformed model output is untrusted data
-        logger.exception("LLM tool_use input failed schema validation")
+        logger.exception("LLM tool call arguments failed JSON/schema validation")
         return []
 
     raw = _to_raw_directives(parsed)
